@@ -35,15 +35,15 @@ class TTbarDataLoader:
     coupling parameters before assembling final Pandas DataFrames.
     """
     
-    def __init__(self, base_path='./drive/MyDrive/Distributions', lumi=500.0, sys_err=0.00, zp_mass=3200):
+    def __init__(self, base_path='./drive/MyDrive/Distributions', lumi=500.0, sys_err=0.00, zp_mass=3200, method='chi2'):
         self.base_path = base_path
         self.lumi = lumi
         self.sys_err = sys_err
         self.zp_mass = zp_mass
+        self.method = method 
         
         # Define the invariant mass (m_tt) bin edges and target signal window.
-        # The mask restricts optimization to the region where resonant signals are expected to peak.
-        self.bins = np.arange(800., 5600., 100.)
+        self.bins = np.arange(1500., 4600., 100.)
         self.mass_mask = (self.bins[:-1] >= 1500) & (self.bins[:-1] <= 5000)
         self.valid_bin_centers = (self.bins[:-1] + np.diff(self.bins) / 2)
         
@@ -51,7 +51,7 @@ class TTbarDataLoader:
         self.best_fits = {}
         self.chi2_denom_masked = None
         self.n_fake = None
-        
+    
     def discover_files(self):
         """Locates and categorizes all required .npz distribution files across model directories."""
         self.files['VLF'] = list(glob.glob(f'{self.base_path}/VLF/qq2ttbar_gs4_ydm2/mass_scan/*.npz')) + \
@@ -67,28 +67,39 @@ class TTbarDataLoader:
         print("\n--- File Discovery Check ---")
         for k, v in self.files.items():
             print(f"{k:<15} files found: {len(v)}")
-            
-    def _find_best_mu(self, n_sig_template, n_fake_data, denom):
+
+    def _find_best_mu(self, n_sig_template, n_fake_data, n_sm, denom=None):
         """
-        Optimizes the signal scaling parameter (mu) by minimizing the chi-square 
-        discrepancy between the scaled signal template and the observed fake data.
-        
-        Depending on the model parametrization, 'mu' can represent an overall 
-        cross-section multiplier or the fourth power of the dark matter coupling (yDM^4).
+        Optimizes the signal scaling parameter (mu) by minimizing either the Pearson Chi-Square 
+        or the binned Poisson log-likelihood ratio (-2 ln Lambda), depending on self.method.
         """
         def objective(mu):
-            return np.sum(((mu * n_sig_template - n_fake_data)**2) / denom, dtype=np.float64)
-
-        # Enforce non-negative signal strength (mu >= 0) to preserve physical validity
+            # EXPECTED yield (lambda): scaled signal + SM background
+            lam = mu * n_sig_template + n_sm
+            
+            # OBSERVED yield: fake data signal + SM background
+            obs = n_fake_data + n_sm
+            
+            # POISSON LOG-LIKELIHOOD RATIO (-2 ln Lambda) 
+            if getattr(self, 'method', 'chi2') == 'llr':
+                lam = np.where(lam > 0, lam, 1e-9)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    log_term = np.where(obs > 0, obs * np.log(obs / lam), 0.0)
+                return 2.0 * np.sum(lam - obs + log_term, dtype=np.float64)
+            
+            # CHI-SQUARE 
+            else:
+                # Background automatically cancels: (mu*S + B) - (Fake + B) = mu*S - Fake
+                return np.sum(((lam - obs)**2) / denom, dtype=np.float64)
         res = minimize(objective, x0=[8.0], bounds=[(0.0, None)])
         return res.x[0], res.fun
 
     def build_baselines_and_scan(self, zp_limit_csv_path='Safe_Limits_Zprime.csv'):
         """
-        Constructs the SM background and Fake Data baseline spectra, scales them to the target 
-        integrated luminosity, and performs parameter scans across mass points to find global minimums.
+        Constructs baselines, scales to target luminosity, and performs parameter scans 
+        across candidate mass points using the selected statistical estimator.
         """
-        # Read reference Z' cross-sections to determine the benchmark fake data target yield
+        # Read reference Z' cross-sections to determine benchmark fake data target yield
         zp_limit = pd.read_csv(zp_limit_csv_path)
         S_tt_dict = dict(zip(zp_limit['mZp_GeV'], zp_limit['S_tt_pb']))
         target_xsec = S_tt_dict[self.zp_mass] * 0.95
@@ -101,12 +112,12 @@ class TTbarDataLoader:
             h_fake, _ = np.histogram(d['mTT'], bins=self.bins, weights=d['weights'])
             self.n_fake += h_fake * self.lumi * 1000.0
 
-        # Normalize the fake data spectrum within the invariant mass window to match the reference target yield
+        # Normalize the fake data spectrum within the invariant mass window
         factor = target_yield / np.sum(self.n_fake[self.mass_mask])
         self.n_fake = self.n_fake * factor
         print(f"Fake Data correctly normalized to yield: {np.sum(self.n_fake[self.mass_mask]):.2f} in target window.")
 
-        # Assemble the Standard Model (SM) background baseline by averaging over available MC samples
+        # Assemble the Standard Model (SM) background baseline by averaging MC samples
         n_sm = np.zeros(len(self.bins) - 1, dtype=np.float64)
         for f in self.files['SM']:
             d = np.load(f, allow_pickle=True)
@@ -114,12 +125,15 @@ class TTbarDataLoader:
             n_sm += h_sm * self.lumi * 1000.0
         n_sm = n_sm / len(self.files['SM']) if len(self.files['SM']) > 0 else n_sm
 
-        # Pre-calculate the variance denominator for chi-square tests, incorporating systematic uncertainties orthogonally
+        # Pre-calculate variance denominator (used when self.method == 'chi2')
         self.chi2_denom_masked = (self.n_fake + n_sm) + (self.sys_err * n_sm)**2
 
         # Execute parameter scans across candidate BSM mass hypotheses
-        print("\nRunning Mass Scans...")
-        chi2_min = {
+        stat_name = "-2lnL" if self.method == 'llr' else "Chi^2"
+        print(f"\nRunning Mass Scans using {stat_name} minimization...")
+        
+        # Tracker stores: (best_mass, min_stat_val, best_mu)
+        stat_min = {
             'VLF': (None, np.inf, 0.),
             'Scalar': (None, np.inf, 0.),
             'Zprime': (None, np.inf, 0.),
@@ -127,7 +141,7 @@ class TTbarDataLoader:
             'FakeData': (1500.0, 0.0, np.sqrt(factor))
         }
 
-        # Scan Vector-Like Fermion (VLF) models across invariant mass points
+        # Scan Vector-Like Fermion (VLF) models
         for m in np.arange(1300., 1900., 100.):
             vlf_scan = glob.glob(f'{self.base_path}/VLF/*/mass_scan/mPsiT_{m:.0f}_mSDM_{(m-100.):.0f}.npz')
             n_vlf = np.zeros(len(self.bins) - 1, dtype=np.float64)
@@ -138,12 +152,11 @@ class TTbarDataLoader:
             
             if np.sum(n_vlf) == 0: 
                 continue
-            best_mu, chi2_val = self._find_best_mu(n_vlf, self.n_fake, self.chi2_denom_masked)
-            # Filter out unphysical coupling constants (yDM >= 7.0 violates perturbative unitarity in this model)
-            if np.sqrt(best_mu) < 7.0 and chi2_val < chi2_min['VLF'][1]:
-                chi2_min['VLF'] = (m, chi2_val, np.sqrt(best_mu))
+            best_mu, stat_val = self._find_best_mu(n_vlf, self.n_fake, n_sm, self.chi2_denom_masked)
+            if np.sqrt(best_mu) < 7.0 and stat_val < stat_min['VLF'][1]:
+                stat_min['VLF'] = (m, stat_val, np.sqrt(best_mu))
 
-        # Scan Scalar dark matter mediator models across invariant mass points
+        # Scan Scalar dark matter mediator models
         for m in np.arange(1300., 1700., 100.):
             scalar_scan = glob.glob(f'{self.base_path}/Scalar/*/mass_scan/mPsiT_{m:.0f}_mSDM_{(m-100.):.0f}.npz')
             n_scalar = np.zeros(len(self.bins) - 1, dtype=np.float64)
@@ -154,14 +167,13 @@ class TTbarDataLoader:
             
             if np.sum(n_scalar) == 0: 
                 continue
-            best_mu, chi2_val = self._find_best_mu(n_scalar, self.n_fake, self.chi2_denom_masked)
-            # Apply perturbative coupling threshold limit for scalar models
-            if np.sqrt(best_mu) < 10.1 and chi2_val < chi2_min['Scalar'][1]:
-                chi2_min['Scalar'] = (m, chi2_val, np.sqrt(best_mu))
+            best_mu, stat_val = self._find_best_mu(n_scalar, self.n_fake, n_sm, self.chi2_denom_masked)
+            if np.sqrt(best_mu) < 10.1 and stat_val < stat_min['Scalar'][1]:
+                stat_min['Scalar'] = (m, stat_val, np.sqrt(best_mu))
 
-        # Scan Z' gauge boson models (evaluating both narrow 1% and broad 20% decay width scenarios)
+        # Scan Z' gauge boson models (1% and 20% widths)
         for m in np.arange(3000., 3600., 100.):
-            # Evaluate narrow width (1%) scenario
+            # Narrow width (1%)
             zp_scan = glob.glob(f'{self.base_path}/Zprime/mass_scan/mZp_{m:.0f}.npz')
             n_Zp = np.zeros(len(self.bins) - 1, dtype=np.float64)
             for f in zp_scan:
@@ -169,11 +181,11 @@ class TTbarDataLoader:
                 h, _ = np.histogram(d['mTT'], bins=self.bins, weights=d['weights'])
                 n_Zp += h * self.lumi * 1000.0
             if np.sum(n_Zp) > 0:
-                best_mu, chi2_val = self._find_best_mu(n_Zp, self.n_fake, self.chi2_denom_masked)
-                if chi2_val < chi2_min['Zprime'][1]:
-                    chi2_min['Zprime'] = (m, chi2_val, np.sqrt(best_mu))
+                best_mu, stat_val = self._find_best_mu(n_Zp, self.n_fake, n_sm, self.chi2_denom_masked)
+                if stat_val < stat_min['Zprime'][1]:
+                    stat_min['Zprime'] = (m, stat_val, np.sqrt(best_mu))
                     
-            # Evaluate broad width (20%) scenario
+            # Broad width (20%)
             zp20_scan = glob.glob(f'{self.base_path}/Zprime/20pc_width/mZp_{m:.0f}.npz')
             n_Zp20 = np.zeros(len(self.bins) - 1, dtype=np.float64)
             for f in zp20_scan:
@@ -181,24 +193,25 @@ class TTbarDataLoader:
                 h, _ = np.histogram(d['mTT'], bins=self.bins, weights=d['weights'])
                 n_Zp20 += h * self.lumi * 1000.0
             if np.sum(n_Zp20) > 0:
-                best_mu, chi2_val = self._find_best_mu(n_Zp20, self.n_fake, self.chi2_denom_masked)
-                if chi2_val < chi2_min['Zprime_20pc'][1]:
-                    chi2_min['Zprime_20pc'] = (m, chi2_val, np.sqrt(best_mu))
+                best_mu, stat_val = self._find_best_mu(n_Zp20, self.n_fake,n_sm, self.chi2_denom_masked)
+                if stat_val < stat_min['Zprime_20pc'][1]:
+                    stat_min['Zprime_20pc'] = (m, stat_val, np.sqrt(best_mu))
 
-        print("\n--- Global Best Fit Results ---")
-        for model, fit in chi2_min.items():
+        print(f"\n--- Global Best Fit Results ({stat_name} Minimization) ---")
+        for model, fit in stat_min.items():
             if fit[0] is not None:
-                print(f"{model:12}: Mass = {fit[0]:.0f} GeV | yDM = {fit[2]:.6e} | Chi^2 = {fit[1]:.2f}")
+                print(f"{model:12}: Mass = {fit[0]:.0f} GeV | yDM = {fit[2]:.6e} | {stat_name} = {fit[1]:.2f}")
 
-        # Store the optimal parameter configurations for downstream DataFrame assembly
+        # Store optimal configurations for downstream DataFrame assembly
         self.best_fits = {
-            'VLF':    {'mPsiT': chi2_min['VLF'][0], 'mSDM': chi2_min['VLF'][0] - 100., 'scale_factor': chi2_min['VLF'][2]},
-            'Scalar': {'mST': chi2_min['Scalar'][0], 'mChi': chi2_min['Scalar'][0] - 100., 'scale_factor': chi2_min['Scalar'][2]},
-            'Zprime': {'mZp': chi2_min['Zprime'][0], 'scale_factor': chi2_min['Zprime'][2]},
-            'Zprime_20pc': {'mZp': chi2_min['Zprime_20pc'][0], 'scale_factor': chi2_min['Zprime_20pc'][2]},
-            'FakeData': {'scale_factor': chi2_min['FakeData'][2]}
+            'VLF':    {'mPsiT': stat_min['VLF'][0], 'mSDM': stat_min['VLF'][0] - 100., 'scale_factor': stat_min['VLF'][2]},
+            'Scalar': {'mST': stat_min['Scalar'][0], 'mChi': stat_min['Scalar'][0] - 100., 'scale_factor': stat_min['Scalar'][2]},
+            'Zprime': {'mZp': stat_min['Zprime'][0], 'scale_factor': stat_min['Zprime'][2]},
+            'Zprime_20pc': {'mZp': stat_min['Zprime_20pc'][0], 'scale_factor': stat_min['Zprime_20pc'][2]},
+            'FakeData': {'scale_factor': stat_min['FakeData'][2]}
         }
-
+    
+            
     def assemble_dataframes(self):
         """
         Loads event arrays exclusively for the optimal mass hypotheses identified during scanning,
@@ -411,7 +424,8 @@ class HistogramBuilder:
 class StatEngine:
     """
     Provides statistical routines including Poisson pseudo-experiment generation, 
-    vectorized chi-square goodness-of-fit evaluations, and formal hypothesis testing.
+    vectorized goodness-of-fit evaluations (Chi-Square and Poisson Log-Likelihood Ratio), 
+    and formal hypothesis testing.
     """
     
     @staticmethod
@@ -436,37 +450,71 @@ class StatEngine:
         return np.random.poisson(lam=clean_lambda, size=(n_copies, len(clean_lambda)))
 
     @staticmethod
-    def compute_chi2_for_models(toys_dict, fake_data_yields, saved_dict, variance_type='model_expect'):
+    def compute_test_statistic(toys_dict, fake_data_yields, saved_dict, variance_type='model_expect', stat_method='chi2'):
         """
-        Evaluates the chi-square goodness-of-fit statistic across all generated pseudo-experiments 
+        Evaluates goodness-of-fit test statistics across all generated pseudo-experiments 
         by comparing them against the baseline Fake Data spectrum.
         
-        Supports multiple variance definitions for the chi-square denominator:
-            * 'model_expect': Pearson chi-square (variance equals expected model yield).
-            * 'fake_data': Neyman chi-square (variance equals observed data yield).
-            * 'total_error': Variance incorporates both systematic and MC statistical uncertainties.
+        Parameters:
+            * stat_method: 'chi2' for standard Pearson/Neyman Chi-Square, or 
+                           'llr' for the binned Poisson Log-Likelihood Ratio (-2 ln Lambda).
+            * variance_type (used only if stat_method='chi2'):
+                - 'model_expect': Pearson chi-square (variance equals expected model yield).
+                - 'fake_data': Neyman chi-square (variance equals observed data yield).
+                - 'total_error': Variance incorporates both systematic and MC statistical uncertainties.
         """
-        chi2_distributions = {}
-        
+        stat_distributions = {}
+        fake_data_yields = toys_dict['FakeData']
         for model_name, toys in toys_dict.items():
-            if variance_type == 'model_expect':
-                denom = saved_dict['models']['SM']['yields'] if model_name == 'SM' else saved_dict['models'][model_name]['yields_total']
-            elif variance_type == 'fake_data':
-                denom = fake_data_yields
-            elif variance_type == 'total_error':
-                denom = saved_dict['models']['SM']['err_total']**2 if model_name == 'SM' else saved_dict['models'][model_name]['err_total']**2
+            if model_name == 'FakeData': continue
+            # Extract the expected model yield for the baseline denominator/reference
+            if model_name == 'SM':
+                lam = saved_dict['models']['SM']['yields']
             else:
-                raise ValueError("Invalid variance_type. Choose: 'model_expect', 'fake_data', or 'total_error'.")
+                lam = saved_dict['models'][model_name]['yields_total']
             
-            # Prevent division by zero in bins with zero expected events
-            clean_denom = np.where(denom <= 0, 1e-10, denom)
+            # POISSON LOG-LIKELIHOOD RATIO (-2 ln Lambda) ---
+            if stat_method == 'llr':
+                clean_lam = np.where(lam <= 0, 1e-10, lam)
+                
+                # 1. THIS IS YOUR CURRENT CODE (Evaluates the 100,000 toys)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    log_term = np.where(toys > 0, toys * np.log(toys / clean_lam), 0.0)
+                stat_per_toy = 2.0 * np.sum(clean_lam - toys + log_term, axis=1)
+
+                # 2. ---> THIS IS WHAT YOU MUST ADD! <--- (Evaluates the Fake Data)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    log_term_data = np.where(fake_data_yields > 0, fake_data_yields * np.log(fake_data_yields / clean_lam), 0.0)
+                stat_data = 2.0 * np.sum(clean_lam - fake_data_yields + log_term_data)
+                
+                # 3. Store BOTH results in your dictionary so your main loop can use them
+                stat_distributions[model_name] = stat_data
+                
+            # CHI-SQUARE ---
+            elif stat_method == 'chi2':
+                if variance_type == 'model_expect':
+                    denom = lam
+                elif variance_type == 'fake_data':
+                    denom = fake_data_yields
+                elif variance_type == 'total_error':
+                    denom = saved_dict['models']['SM']['err_total']**2 if model_name == 'SM' else (#saved_dict['models'][model_name]['err_total']**2 
+                                                                                                    + saved_dict['models']['FakeData']['err_total']**2)
+                else:
+                    raise ValueError("Invalid variance_type. Choose: 'model_expect', 'fake_data', or 'total_error'.")
+                
+                # Prevent division by zero in bins with zero expected events
+                clean_denom = np.where(denom <= 0, 1e-10, denom)
+                
+                # Vectorized calculation of Pearson chi-square across all pseudo-experiments simultaneously
+                lbl = 'yields' if model_name == 'SM' else 'yields_total'
+                squared_diff = (saved_dict['models'][model_name][lbl] - fake_data_yields)**2
+                stat_per_toy = np.sum(squared_diff / clean_denom, axis=1)
+                stat_distributions[model_name] = stat_per_toy
+                
+            else:
+                raise ValueError("Invalid stat_method. Choose: 'llr' or 'chi2'.")
             
-            # Vectorized calculation of Pearson chi-square across all pseudo-experiments simultaneously
-            squared_diff = (toys - fake_data_yields)**2
-            chi2_per_toy = np.sum(squared_diff / clean_denom, axis=1)
-            chi2_distributions[model_name] = chi2_per_toy
-            
-        return chi2_distributions
+        return stat_distributions
 
     @staticmethod
     def run_hypothesis_test(chi2_dict, k_bins=60, alpha=0.05):
@@ -585,7 +633,7 @@ class ColliderPlotter:
         plt.show()
 
     @classmethod
-    def plot_chi2_distributions(cls, chi2_dict, n_bins_dof, bins=50):
+    def plot_chi2_distributions(cls, chi2_dict, n_bins_dof, bins=50, lumi = 500):
         """
         Plots the computed chi-square distributions across all model pseudo-experiments 
         and overlays the continuous theoretical chi-square probability density function (PDF).
@@ -609,10 +657,10 @@ class ColliderPlotter:
             plt.hist(chi2_vals, bins=bin_edges, density=True, histtype='stepfilled', 
                      color=c, alpha=0.15, zorder=2)
 
-        plt.title(r"$\chi^2$ Goodness-of-Fit Distributions vs. FakeData", fontsize=14, pad=10)
-        plt.xlabel(r"$\chi^2$ Test Statistic", fontsize=13)
-        plt.ylabel("Probability Density", fontsize=13)
-        plt.legend(loc="upper right", fontsize=11, framealpha=0.9)
+        plt.title(rf"$\chi^2$ Distributions | $\mathcal{{L}} = {lumi}$ $\rm{{fb}}^{{-1}}$", pad=10)
+        plt.xlabel(r"$\chi^2$ (Hyphotesis vs Fake Data)")
+        plt.ylabel("Probability Density")
+        plt.legend(loc="upper right", framealpha=0.9)
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.xlim(x_min, x_max)
         plt.tight_layout()
