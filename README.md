@@ -16,7 +16,7 @@ Due to file size limits, the simulated Monte Carlo distributions and data files 
 
 ### Step 1: Download the Data
 1. Access the dataset via the following Google Drive link:
-    **https://drive.google.com/drive/folders/1XXAkBqvWX6iiYFSMeAb-wdzKgTwuUMXi?usp=sharing**
+    **https://drive.google.com/drive/folders/1XXAkBqvWX6iiYFSMeAb-wdzKgTwuUMXi?usp=drive_link**
 2. Download the entire folder (if downloading from Google Drive via browser, it may download as one or more `.zip` files; make sure to extract and merge them into a single folder).
 3. If you are using **Google Colab**, upload the extracted folder to your personal Google Drive so you can mount it directly in the notebook. If you are running **locally**, place the folder anywhere on your local machine.
 
