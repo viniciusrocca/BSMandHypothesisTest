@@ -7,7 +7,7 @@ pair (ttbar) collider analyses.
 This module provides an end-to-end pipeline:
     * TTbarDataLoader: File discovery, cross-section normalization, signal-strength optimization, and memory-efficient DataFrame assembly.
     * HistogramBuilder: 1D event binning, luminosity scaling, and signal-plus-background hypothesis construction.
-    * StatEngine: Poisson pseudo-experiment (toy) generation, vectorized Pearson chi^2 calculations, and formal hypothesis testing.
+    * StatEngine: Poisson pseudo-experiment (toy) generation, vectorized chi^2 calculations, and formal hypothesis testing.
     * ColliderPlotter: Professional High-Energy Physics (HEP) visualization for yield ratios and goodness-of-fit distributions.
 """
 
@@ -61,6 +61,7 @@ class TTbarDataLoader:
         self.files['Zprime'] = list(glob.glob(f'{self.base_path}/Zprime/mass_scan/*.npz'))
         self.files['Zprime_20pc'] = list(glob.glob(f'{self.base_path}/Zprime/20pc_width/*.npz'))
         self.files['SM'] = list(glob.glob(f'{self.base_path}/SM/pp2ttbar/bias_article*/*.npz'))
+        # Here you can choose the model behind the FakeData
         self.files['FakeData'] = list(glob.glob(f'{self.base_path}/Scalar/qq2ttbar_gs4_ydm2/bias_article/mPsiT_1500_mSDM_1400.npz')) + \
                                  list(glob.glob(f'{self.base_path}/Scalar/gg2ttbar_gs4_ydm2/bias_article/mPsiT_1500_mSDM_1400.npz'))
         
@@ -74,7 +75,7 @@ class TTbarDataLoader:
         or the binned Poisson log-likelihood ratio (-2 ln Lambda), depending on self.method.
         """
         def objective(mu):
-            # EXPECTED yield (lambda): scaled signal + SM background
+            # EXPECTED yield: scaled signal + SM background
             lam = mu * n_sig_template + n_sm
             
             # OBSERVED yield: fake data signal + SM background
@@ -407,7 +408,7 @@ class HistogramBuilder:
             err_total = np.sqrt(hErr_sm**2 + err_bsm_only**2)
 
             saved_distributions['models'][lab_str] = {
-                'yields_total': h_total,       # Total expected rate (lambda) used for Poisson sampling
+                'yields_total': h_total,       
                 'yields_bsm_only': h_bsm_only,
                 'err_total': err_total,
                 'err_bsm_only': err_bsm_only,
@@ -433,9 +434,6 @@ class StatEngine:
         """
         Generates N Poisson-distributed pseudo-experiments (toys) for a specified model hypothesis.
         
-        In HEP, expected rates can sometimes drop slightly below zero due to destructive 
-        interference terms at Next-to-Leading Order (NLO). Because the Poisson rate parameter 
-        lambda must be non-negative, rates are clipped at zero prior to sampling.
         """
         if model_name not in saved_dict['models']:
             raise ValueError(f"Model '{model_name}' not found. Available: {list(saved_dict['models'].keys())}")
@@ -473,24 +471,21 @@ class StatEngine:
             else:
                 lam = saved_dict['models'][model_name]['yields_total']
             
-            # POISSON LOG-LIKELIHOOD RATIO (-2 ln Lambda) ---
+            # POISSON LOG-LIKELIHOOD RATIO (-2 ln Lambda) 
             if stat_method == 'llr':
                 clean_lam = np.where(lam <= 0, 1e-10, lam)
                 
-                # 1. THIS IS YOUR CURRENT CODE (Evaluates the 100,000 toys)
                 with np.errstate(divide='ignore', invalid='ignore'):
                     log_term = np.where(toys > 0, toys * np.log(toys / clean_lam), 0.0)
                 stat_per_toy = 2.0 * np.sum(clean_lam - toys + log_term, axis=1)
 
-                # 2. ---> THIS IS WHAT YOU MUST ADD! <--- (Evaluates the Fake Data)
                 with np.errstate(divide='ignore', invalid='ignore'):
                     log_term_data = np.where(fake_data_yields > 0, fake_data_yields * np.log(fake_data_yields / clean_lam), 0.0)
                 stat_data = 2.0 * np.sum(clean_lam - fake_data_yields + log_term_data)
-                
-                # 3. Store BOTH results in your dictionary so your main loop can use them
+
                 stat_distributions[model_name] = stat_data
                 
-            # CHI-SQUARE ---
+            # CHI-SQUARE
             elif stat_method == 'chi2':
                 if variance_type == 'model_expect':
                     denom = lam
